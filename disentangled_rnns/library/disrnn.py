@@ -100,6 +100,56 @@ def reparameterize_sigma(
   return jnp.abs(hk_param) + min_sigma
 
 
+# Added: standalone lagged cross-correlation penalty between latents. This
+# cannot live inside HkDisentangledRNN.__call__ because that method only ever
+# sees a single timestep; lag requires the full latent trajectory, so this is
+# meant to be called once on the sequence returned by unrolling the RNN.
+def compute_cross_correlation_penalty(
+    latents_sequence: jnp.ndarray,
+    max_lag: int = 5,
+) -> jnp.ndarray:
+  """Computes a penalty for lagged cross-correlation between latents.
+
+  Penalizes cases where one latent is a (possibly lagged, possibly filtered)
+  function of another latent, e.g. a lagged low-pass version of it, by
+  checking correlation between every pair of latents at every lag in
+  [-max_lag, max_lag], not just at lag 0.
+
+  Args:
+    latents_sequence: Latent trajectory of shape (n_steps, batch_size,
+      latent_size), e.g. as returned by hk.dynamic_unroll over the RNN core.
+    max_lag: The largest positive/negative lag (in steps) to check for
+      cross-correlation between latent pairs.
+
+  Returns:
+    penalty: Cross-correlation penalty. Shape is (batch_size,).
+  """
+  n_steps, batch_size, latent_size = latents_sequence.shape
+
+  mean = jnp.mean(latents_sequence, axis=0, keepdims=True)
+  std = jnp.std(latents_sequence, axis=0, keepdims=True) + 1e-6
+  normed = (latents_sequence - mean) / std
+
+  off_diagonal_mask = 1.0 - jnp.eye(latent_size)
+
+  penalty = jnp.zeros(shape=(batch_size,))
+  for lag in range(-max_lag, max_lag + 1):
+    if lag >= 0:
+      a = normed[lag:]
+      b = normed[: n_steps - lag]
+    else:
+      a = normed[: n_steps + lag]
+      b = normed[-lag:]
+    n_overlap = a.shape[0]
+    # (batch_size, latent_size, latent_size) cross-correlation at this lag
+    cross_corr = jnp.einsum('tbi,tbj->bij', a, b) / n_overlap
+    # Exclude self-correlation only at lag 0, where it is expected to be ~1
+    mask = off_diagonal_mask if lag == 0 else jnp.ones_like(off_diagonal_mask)
+    penalty += jnp.sum(jnp.square(cross_corr) * mask[None, :, :], axis=(1, 2))
+
+  return penalty
+
+
 @dataclasses.dataclass
 class DisRnnConfig:
   """Specifies an architecture and configuration for a Disentangled RNN.
@@ -129,6 +179,11 @@ class DisRnnConfig:
     activation: String defining an activation function. Must be in jax.nn.
     max_latent_value: Cap on the possible absolute value of a latent. Used to
       prevent runaway latents resulting in NaNs
+    cross_corr_penalty: Multiplier for the lagged cross-correlation penalty
+      between latents, computed externally over an unrolled sequence via
+      compute_cross_correlation_penalty
+    cross_corr_max_lag: Maximum lag (in time steps) considered when computing
+      the cross-correlation penalty between latents
     x_names: Names of the observation vector elements. Must have length obs_size
     y_names: Names of the target vector elements. Must have length target_size
   """
@@ -149,6 +204,10 @@ class DisRnnConfig:
   update_net_obs_penalty: float = 0.0
   update_net_latent_penalty: float = 0.0
   choice_net_latent_penalty: float = 0.0
+
+  # Added: config for the new lagged cross-correlation penalty
+  cross_corr_penalty: float = 0.0
+  cross_corr_max_lag: int = 5
 
   l2_scale: float = 0.01
 
@@ -332,6 +391,11 @@ class HkDisentangledRNN(hk.RNNCore):
     self._choice_net_latent_penalty = config.choice_net_latent_penalty
     self._activation = getattr(jax.nn, config.activation)
     self._max_latent_value = config.max_latent_value
+
+    # Added: stored for use by callers that unroll this core and then call
+    # compute_cross_correlation_penalty on the resulting latent sequence.
+    self._cross_corr_penalty = config.cross_corr_penalty
+    self._cross_corr_max_lag = config.cross_corr_max_lag
 
     # Get Haiku parameters. IMPORTANT: if you are subclassing HkDisentangledRNN,
     # you must override _get_haiku_parameters to add any new parameters that you
@@ -537,14 +601,32 @@ class HkDisentangledRNN(hk.RNNCore):
 
     # Output has shape (batch_size, output_size + 1).
     # The first output_size elements are the predicted targets, and the last
-    # element is the penalty. We preassign instead of using concatenate to avoid
-    # errors caused by silent broadcasting.
+    # element is the penalty. 
     output_shape = (batch_size, self._output_size + 1)
     output = jnp.zeros(output_shape)
     output = output.at[:, :-1].set(predicted_targets)
     output = output.at[:, -1].set(penalty)
 
     return output, new_latents
+
+  # Added: convenience wrapper so the cross-correlation penalty is configured
+  # and invoked consistently with the rest of the bottleneck penalties, even
+  # though it must be applied to a full unrolled sequence rather than inside
+  # __call__. Call this once per training step on the latent sequence.
+  def cross_correlation_penalty(self, latents_sequence: jnp.ndarray) -> jnp.ndarray:
+    """Computes the configured lagged cross-correlation penalty on a sequence.
+
+    Args:
+      latents_sequence: Latent trajectory of shape (n_steps, batch_size,
+        latent_size), e.g. the second output of hk.dynamic_unroll over this
+        core.
+    Returns:
+      penalty: Cross-correlation penalty, shape (batch_size,).
+    """
+    penalty = compute_cross_correlation_penalty(
+        latents_sequence, max_lag=self._cross_corr_max_lag
+    )
+    return self._cross_corr_penalty * penalty
 
 
 def log_bottlenecks(
