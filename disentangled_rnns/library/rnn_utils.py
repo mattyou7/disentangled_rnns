@@ -989,8 +989,14 @@ def train_network(
     core = make_network()
     batch_size = jnp.shape(xs)[1]
     state = core.initial_state(batch_size)
-    ys, _ = hk.dynamic_unroll(core, xs, state)
-    return ys
+    ys, states = hk.dynamic_unroll(
+    core,
+    xs,
+    state,
+    return_all_states=True,
+    )
+
+  return ys, states
 
   # Haiku, step two: Transform the network into a pair of functions
   # (model.init and model.apply)
@@ -1037,7 +1043,7 @@ def train_network(
     penalty, n_unmasked_samples = compute_penalty(batch['ys'], model_output)
     penalty_scale = get_loss_param(loss_param, 'penalty_scale', 1.0)
     loss = (
-        mse(batch['ys'], y_hats) + penalty_scale * penalty / n_unmasked_samples
+        mse(batch['ys'], y_hats) + penalty_scale * penalty + cross_cor / n_unmasked_samples
     )
     return loss
 
@@ -1055,7 +1061,7 @@ def train_network(
   ) -> float:
     """Treats the last element of the model outputs as a penalty."""
     # (n_steps, n_episodes, n_targets)
-    model_output = model.apply(params, random_key, batch['xs'])
+    model_output, states = model.apply(params, random_key, batch['xs'])
     output_logits = model_output[:, :, :-1]
     penalty, _ = compute_penalty(batch['ys'], model_output)
     nll, n_unmasked_samples = categorical_neg_log_likelihood(
@@ -1072,7 +1078,7 @@ def train_network(
   ) -> float:
     """A loss that combines categorical and continuous targets."""
 
-    model_output = model.apply(params, random_key, batch['xs'])
+    model_output, states = model.apply(params, random_key, batch['xs'])
     y_hats = model_output
     likelihood_weight = get_loss_param(loss_param, 'likelihood_weight', 1.0)
     loss = jax.jit(likelihood_and_sse)(
@@ -1101,7 +1107,7 @@ def train_network(
     """
 
     penalty_scale = get_loss_param(loss_param, 'penalty_scale', 1.0)
-    model_output = model.apply(params, random_key, batch['xs'])
+    model_output, states = model.apply(params, random_key, batch['xs'])
 
     y_hats = model_output
     likelihood_weight = get_loss_param(loss_param, 'likelihood_weight', 0.5)
@@ -1264,8 +1270,14 @@ def eval_network(
     state = core.initial_state(batch_size)
     if return_states:
       return hk.dynamic_unroll(core, xs, state, return_all_states=True)
-    ys, _ = hk.dynamic_unroll(core, xs, state, return_all_states=False)
-    return ys
+    ys, states = hk.dynamic_unroll(
+      core,
+      xs,
+      state,
+      return_all_states=True,
+    )
+
+return ys, states
 
   model = hk.transform(unroll_network)
   key = jax.random.PRNGKey(np.random.randint(2**32))
@@ -1427,7 +1439,14 @@ def get_new_params(
     core = make_network()
     batch_size = xs.shape[1]
     state = core.initial_state(batch_size=batch_size)
-    ys, _ = hk.dynamic_unroll(core, xs, state)
+    ys, states = hk.dynamic_unroll(
+      core,
+      xs,
+      state,
+      return_all_states=True,
+    )
+
+return ys, states
     return ys
 
   model = hk.transform(unroll_network)
