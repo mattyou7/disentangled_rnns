@@ -319,8 +319,6 @@ class DatasetRNNMixed(DatasetRNN):
   ):
     # By convention, for y_type=='mixed' the first element of the target
     # is assumed to be categorical.
-    # TODO(b/478851015): Add support for explicitly separating categorical and
-    # continuous targets.
     categorical_index = 0
     categorical_ys = ys[:, :, categorical_index]
     uniques = np.unique(categorical_ys)
@@ -992,8 +990,9 @@ def train_network(
     ys, latents = hk.dynamic_unroll(core, xs, state, return_all_states=True)
     if hasattr(core, 'cross_correlation_penalty'):
       cc_penalty = core.cross_correlation_penalty(latents)  # (batch_size,)
-      ys = ys.at[-1, :, -1].add(cc_penalty)
-    return ys
+    else:
+      cc_penalty = jnp.zeros(batch_size)
+    return ys, latents, cc_penalty
 
   # Haiku, step two: Transform the network into a pair of functions
   # (model.init and model.apply)
@@ -1026,7 +1025,7 @@ def train_network(
   # Define possible losses and training step #
   ###########################################
   def mse_loss(params, batch, random_key) -> float:
-    y_hats = model.apply(params, random_key, batch['xs'])
+    y_hats, states, cc_penalty = model.apply(params, random_key, batch['xs'])
     loss = mse(batch['ys'], y_hats)
     return loss
 
@@ -1035,17 +1034,19 @@ def train_network(
   ) -> float:
     """Treats the last element of the model outputs as a penalty."""
     # (n_steps, n_episodes, n_targets+1)
-    model_output = model.apply(params, random_key, batch['xs'])
+    model_output, states, cc_penalty = model.apply(params, random_key, batch['xs'])
     y_hats = model_output[:, :, :-1]
     penalty, n_unmasked_samples = compute_penalty(batch['ys'], model_output)
     penalty_scale = get_loss_param(loss_param, 'penalty_scale', 1.0)
     loss = (
-        mse(batch['ys'], y_hats) + penalty_scale * penalty + cross_cor / n_unmasked_samples
+        mse(batch['ys'], y_hats) 
+        + penalty_scale * (penalty / n_unmasked_samples) 
+        + jnp.mean(cc_penalty)
     )
     return loss
 
   def categorical_loss(params, batch, random_key) -> float:
-    output_logits = model.apply(params, random_key, batch['xs'])
+    output_logits, states, cc_penalty = model.apply(params, random_key, batch['xs'])
     nll, n_unmasked_samples = categorical_neg_log_likelihood(
         batch['ys'],
         output_logits,
@@ -1058,7 +1059,7 @@ def train_network(
   ) -> float:
     """Treats the last element of the model outputs as a penalty."""
     # (n_steps, n_episodes, n_targets)
-    model_output, states = model.apply(params, random_key, batch['xs'])
+    model_output, states, cc_penalty = model.apply(params, random_key, batch['xs'])
     output_logits = model_output[:, :, :-1]
     penalty, _ = compute_penalty(batch['ys'], model_output)
     nll, n_unmasked_samples = categorical_neg_log_likelihood(
@@ -1067,7 +1068,7 @@ def train_network(
     penalty_scale = get_loss_param(loss_param, 'penalty_scale', 1.0)
     avg_nll = nll / n_unmasked_samples
     avg_penalty = penalty / n_unmasked_samples
-    loss = avg_nll + penalty_scale * avg_penalty
+    loss = avg_nll + penalty_scale * avg_penalty + jnp.mean(cc_penalty)
     return loss
 
   def hybrid_loss(
@@ -1075,8 +1076,7 @@ def train_network(
   ) -> float:
     """A loss that combines categorical and continuous targets."""
 
-    model_output, states = model.apply(params, random_key, batch['xs'])
-    y_hats = model_output
+    y_hats, states, cc_penalty = model.apply(params, random_key, batch['xs'])
     likelihood_weight = get_loss_param(loss_param, 'likelihood_weight', 1.0)
     loss = jax.jit(likelihood_and_sse)(
         batch['ys'], y_hats, likelihood_weight=likelihood_weight
@@ -1104,7 +1104,7 @@ def train_network(
     """
 
     penalty_scale = get_loss_param(loss_param, 'penalty_scale', 1.0)
-    model_output, states = model.apply(params, random_key, batch['xs'])
+    model_output, states, cc_penalty = model.apply(params, random_key, batch['xs'])
 
     y_hats = model_output
     likelihood_weight = get_loss_param(loss_param, 'likelihood_weight', 0.5)
@@ -1113,7 +1113,7 @@ def train_network(
     )
     penalty, n_unmasked_samples = compute_penalty(batch['ys'], y_hats)
     avg_penalty = penalty / n_unmasked_samples
-    loss = supervised_loss + penalty_scale * avg_penalty
+    loss = supervised_loss + penalty_scale * avg_penalty + jnp.mean(cc_penalty)
     return loss
 
   losses = {
@@ -1265,16 +1265,10 @@ def eval_network(
     core = make_network()
     batch_size = jnp.shape(xs)[1]
     state = core.initial_state(batch_size)
+    ys, states = hk.dynamic_unroll(core, xs, state, return_all_states=True)
     if return_states:
-      return hk.dynamic_unroll(core, xs, state, return_all_states=True)
-    ys, states = hk.dynamic_unroll(
-      core,
-      xs,
-      state,
-      return_all_states=True,
-    )
-
-return ys, states
+      return ys, states
+    return ys
 
   model = hk.transform(unroll_network)
   key = jax.random.PRNGKey(np.random.randint(2**32))
@@ -1442,8 +1436,6 @@ def get_new_params(
       state,
       return_all_states=True,
     )
-
-return ys, states
     return ys
 
   model = hk.transform(unroll_network)
