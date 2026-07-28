@@ -989,14 +989,11 @@ def train_network(
     core = make_network()
     batch_size = jnp.shape(xs)[1]
     state = core.initial_state(batch_size)
-    ys, states = hk.dynamic_unroll(
-    core,
-    xs,
-    state,
-    return_all_states=True,
-    )
-
-  return ys, states
+    ys, latents = hk.dynamic_unroll(core, xs, state, return_all_states=True)
+    if hasattr(core, 'cross_correlation_penalty'):
+      cc_penalty = core.cross_correlation_penalty(latents)  # (batch_size,)
+      ys = ys.at[-1, :, -1].add(cc_penalty)
+    return ys
 
   # Haiku, step two: Transform the network into a pair of functions
   # (model.init and model.apply)
